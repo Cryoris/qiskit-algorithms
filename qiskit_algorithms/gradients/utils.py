@@ -23,6 +23,7 @@ from enum import Enum
 
 import numpy as np
 
+from qiskit.converters import circuit_to_dag, dag_to_circuit
 from qiskit.circuit import (
     ClassicalRegister,
     Gate,
@@ -31,6 +32,8 @@ from qiskit.circuit import (
     ParameterExpression,
     QuantumCircuit,
     QuantumRegister,
+    Clbit,
+    Qubit,
 )
 from qiskit.circuit.library.standard_gates import (
     CXGate,
@@ -44,6 +47,8 @@ from qiskit.circuit.library.standard_gates import (
     RZXGate,
     RZZGate,
     XGate,
+    SdgGate,
+    HGate,
 )
 from qiskit.quantum_info import SparsePauliOp
 
@@ -115,36 +120,39 @@ def _make_lin_comb_gradient_circuit(
     circuit: QuantumCircuit, add_measurement: bool = False
 ) -> dict[Parameter, QuantumCircuit]:
     """Makes a circuit that computes the linear combination of the gradient circuits."""
-    circuit_temp = circuit.copy()
+    # turn the circuit into a DAG for easier manipulation
+    lcu = circuit_to_dag(circuit, copy_operations=True)
     qr_aux = QuantumRegister(1, "qr_aux")
     cr_aux = ClassicalRegister(1, "cr_aux")
-    circuit_temp.add_register(qr_aux)
-    circuit_temp.add_register(cr_aux)
-    circuit_temp.h(qr_aux)
-    circuit_temp.data.insert(0, circuit_temp.data.pop())
-    circuit_temp.sdg(qr_aux)
-    circuit_temp.data.insert(1, circuit_temp.data.pop())
 
     lin_comb_circuits = {}
-    for i, instruction in enumerate(circuit_temp.data):
-        if instruction.operation.is_parameterized():
-            for p in instruction.operation.params[0].parameters:  # pylint: disable=invalid-name
-                gate = _gate_gradient(instruction.operation)
-                lin_comb_circuit = circuit_temp.copy()
-                # insert `gate` to i-th position
-                lin_comb_circuit.append(gate, [qr_aux[0]] + list(instruction.qubits), [])
-                lin_comb_circuit.data.insert(i, lin_comb_circuit.data.pop())
-                lin_comb_circuit.h(qr_aux)
+    for node in lcu.topological_op_nodes():
+        if node.op.is_parameterized():
+            for p in node.op.params[0].parameters:  # pylint: disable=invalid-name
+                gate = _gate_gradient(node.op)
+
+                # rebuild the DAG with the gradient gate inplace
+                gradient_dag = lcu.copy_empty_like()
+                gradient_dag.add_qreg(qr_aux)
+                gradient_dag.add_creg(cr_aux)
+
+                gradient_dag.apply_operation_back(HGate(), [qr_aux[0]])
+                gradient_dag.apply_operation_back(SdgGate(), [qr_aux[0]])
+                for node_ in lcu.topological_op_nodes():
+                    # if we hit the node we derive, insert the gradient gate
+                    if node_ == node:
+                        gradient_dag.apply_operation_back(gate, [qr_aux[0]] + list(node_.qargs))
+
+                    gradient_dag.apply_operation_back(node_.op, node_.qargs, check=False)
+
+                gradient_dag.apply_operation_back(HGate(), [qr_aux[0]])
+
+                # turn it back into a circuit
+                gradient_circuit = dag_to_circuit(gradient_dag, copy_operations=False)
                 if add_measurement:
-                    lin_comb_circuit.measure(qr_aux, cr_aux)
-                # This next line which assigns data is a workaround otherwise the
-                # circuit parameters may not be properly recognized as data is now
-                # managed in Rust and changing things may break parameters - making a
-                # copy of itself by assignment sorts things out.
-                # See https://github.com/Qiskit/qiskit/blob/main/releasenotes/notes
-                #     /circuit-gates-rust-5c6ab6c58f7fd2c9.yaml#L47-L79
-                lin_comb_circuit.data = lin_comb_circuit.data
-                lin_comb_circuits[p] = lin_comb_circuit
+                    gradient_circuit.measure(qr_aux, cr_aux)
+
+                lin_comb_circuits[p] = gradient_circuit
 
     return lin_comb_circuits
 
